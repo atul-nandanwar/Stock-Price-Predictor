@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
 from datetime import timedelta
+import requests
 
 # ============================================================
 # PAGE CONFIGURATION & ULTRA-FUTURISTIC CSS
@@ -72,11 +73,24 @@ def load_model():
     features = joblib.load(FEATURE_PATH)
     return model, features
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_data(ticker, period="2y"):
-    data = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-    ticker_obj = yf.Ticker(ticker)
-    info = ticker_obj.info if hasattr(ticker_obj, 'info') else {}
+    # Custom headers to prevent Yahoo Finance 429 Rate Limiting
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    })
+    
+    try:
+        ticker_obj = yf.Ticker(ticker, session=session)
+        data = ticker_obj.history(period=period)
+        if data.empty:
+            data = yf.download(ticker, period=period, progress=False, session=session)
+        info = ticker_obj.info if hasattr(ticker_obj, 'info') else {}
+    except Exception:
+        data = pd.DataFrame()
+        info = {}
+        
     return data, info
 
 def prepare_features(data):
@@ -84,6 +98,11 @@ def prepare_features(data):
         data.columns = data.columns.get_level_values(0)
     
     req = ["Open", "High", "Low", "Close", "Volume"]
+    available_cols = [c for c in req if c in data.columns]
+    
+    if len(available_cols) < 5:
+        return pd.DataFrame()
+        
     df = data[req].copy()
     for col in req:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -96,8 +115,9 @@ def prepare_features(data):
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    rs = gain / (loss.replace(0, np.nan))
     df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = df['RSI'].fillna(50)
     
     return df.dropna()
 
@@ -121,7 +141,7 @@ with st.sidebar:
     elif market_type == "US Tech / Global":
         ticker = st.selectbox(
             "Select US Stock",
-            ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "INTC"]
+            ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "INTC"]
         )
         currency_sym = "$"
     elif market_type == "Crypto":
@@ -168,12 +188,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-with st.spinner(f"Connecting to live global feed for {ticker}..."):
+with st.spinner(f"Connecting to feed for {ticker}..."):
     try:
         raw_data, info = get_stock_data(ticker)
+        
+        # Fallback Mechanism if API is rate-limited on Cloud
         if raw_data.empty:
-            st.error(f"Asset '{ticker}' not found. Note: For Indian stocks use '.NS' suffix (e.g. RELIANCE.NS).")
-            st.stop()
+            fallback_csv = PROJECT_ROOT / "dataset" / "AAPL_stock_data.csv"
+            if fallback_csv.exists():
+                st.warning("⚠️ Live Yahoo Finance rate-limit reached. Displaying cached local benchmark data.")
+                raw_data = pd.read_csv(fallback_csv, index_col=0, parse_dates=True)
+            else:
+                st.error(f"Asset '{ticker}' rate-limited by Yahoo Finance. Please wait 1 minute and click Rerun.")
+                st.stop()
             
         prepared_data = prepare_features(raw_data)
         if prepared_data.empty:
@@ -199,10 +226,10 @@ with st.spinner(f"Connecting to live global feed for {ticker}..."):
         elif next_date.weekday() == 6: next_date += timedelta(days=1)
         
         # Header Info
-        company_name = info.get('longName', ticker)
+        company_name = info.get('longName', ticker) if isinstance(info, dict) else ticker
         st.markdown(f"<h1 style='color:#FFFFFF; font-family:Orbitron;'>{company_name} <span style='color:#00F0FF;'>[{ticker}]</span></h1>", unsafe_allow_html=True)
         
-        # Futuristic Metric Cards
+        # Metric Cards
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Live Market Price", f"{currency_sym}{current_price:,.2f}")
         m2.metric("AI Target Prediction", f"{currency_sym}{predicted_price:,.2f}", delta=f"{pct_diff:+.2f}%")
@@ -228,7 +255,7 @@ with st.spinner(f"Connecting to live global feed for {ticker}..."):
         window_dict = {"1 Mo": 22, "3 Mo": 66, "6 Mo": 132, "1 Yr": 252, "2 Yr": 504}
         plot_df = prepared_data.tail(window_dict.get(timeframe, 252))
         
-        # Main Candlestick / Line
+        # Candlestick or Line Chart
         if "Candlestick" in chart_mode:
             fig.add_trace(go.Candlestick(
                 x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
@@ -245,7 +272,6 @@ with st.spinner(f"Connecting to live global feed for {ticker}..."):
             fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_7'], name='MA (7)', line=dict(color='#FFB800', width=1.5)), row=1, col=1)
             fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_21'], name='MA (21)', line=dict(color='#BD00FF', width=1.5)), row=1, col=1)
             
-        # Plot Prediction Target
         if show_forecast_line:
             fig.add_trace(go.Scatter(
                 x=[plot_df.index[-1], next_date],
@@ -279,17 +305,17 @@ with st.spinner(f"Connecting to live global feed for {ticker}..."):
         
         st.plotly_chart(fig, use_container_width=True)
         
-        # Tabs for Raw Analysis
+        # Diagnostic Tabs
         t1, t2 = st.tabs(["⚡ Neural Vector Feed", "📈 Quantitative Signals"])
         with t1:
             st.dataframe(plot_df.tail(10).sort_index(ascending=False), use_container_width=True)
         with t2:
             st.json({
                 "Asset Symbol": ticker,
-                "Latest RSI": round(latest['RSI'], 2),
-                "MA 7 Spread": round(current_price - latest['MA_7'], 2),
-                "MA 21 Spread": round(current_price - latest['MA_21'], 2),
-                "Predicted Target Price": round(predicted_price, 2),
+                "Latest RSI": round(float(latest['RSI']), 2),
+                "MA 7 Spread": round(float(current_price - latest['MA_7']), 2),
+                "MA 21 Spread": round(float(current_price - latest['MA_21']), 2),
+                "Predicted Target Price": round(float(predicted_price), 2),
                 "Target Timestamp": str(next_date.date())
             })
 
